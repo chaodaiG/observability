@@ -37,14 +37,15 @@ function banner() {
 
 # Tag images in the yaml files if $TAG is not empty.
 # $KO_DOCKER_REPO is the registry containing the images to tag with $TAG.
-# Parameters: $1..$n - yaml files to parse for images.
+# Parameters: $1..$n - files to parse for images (non .yaml files are ignored).
 function tag_images_in_yamls() {
   [[ -z ${TAG} ]] && return 0
   local SRC_DIR="${GOPATH}/src/"
   local DOCKER_BASE="${KO_DOCKER_REPO}/${REPO_ROOT_DIR/$SRC_DIR}"
   local GEO_REGIONS="${GEO_REPLICATION[@]} "
-  echo "Tagging images under '${DOCKER_BASE}' with ${TAG}"
+  echo "Tagging any images under '${DOCKER_BASE}' with ${TAG}"
   for file in $@; do
+    [[ "${file##*.}" != "yaml" ]] && continue
     echo "Inspecting ${file}"
     for image in $(grep -o "${DOCKER_BASE}/[a-z\./-]\+@sha256:[0-9a-f]\+" ${file}); do
       for region in "" ${GEO_REGIONS// /. }; do
@@ -54,17 +55,17 @@ function tag_images_in_yamls() {
   done
 }
 
-# Copy the given yaml files to the $RELEASE_GCS_BUCKET bucket's "latest" directory.
+# Copy the given files to the $RELEASE_GCS_BUCKET bucket's "latest" directory.
 # If $TAG is not empty, also copy them to $RELEASE_GCS_BUCKET bucket's "previous" directory.
-# Parameters: $1..$n - yaml files to copy.
-function publish_yamls() {
+# Parameters: $1..$n - files to copy.
+function publish_to_gcs() {
   function verbose_gsutil_cp {
     local DEST="gs://${RELEASE_GCS_BUCKET}/$1/"
     shift
     echo "Publishing [$@] to ${DEST}"
     gsutil -m cp $@ ${DEST}
   }
-  # Before publishing the YAML files, cleanup the `latest` dir if it exists.
+  # Before publishing the files, cleanup the `latest` dir if it exists.
   local latest_dir="gs://${RELEASE_GCS_BUCKET}/latest"
   if [[ -n "$(gsutil ls ${latest_dir} 2> /dev/null)" ]]; then
     echo "Cleaning up '${latest_dir}' first"
@@ -88,6 +89,7 @@ RELEASE_GCS_BUCKET=""
 KO_FLAGS=""
 VALIDATION_TESTS="./test/presubmit-tests.sh"
 YAMLS_TO_PUBLISH=""
+ARTIFACTS_TO_PUBLISH=""
 FROM_NIGHTLY_RELEASE=""
 FROM_NIGHTLY_RELEASE_GCS=""
 export KO_DOCKER_REPO=""
@@ -155,30 +157,30 @@ function prepare_auto_release() {
   TAG_RELEASE=1
   PUBLISH_RELEASE=1
 
-  git fetch --all
+  git fetch --all || abort "error fetching branches/tags from remote"
   local tags="$(git tag | cut -d 'v' -f2 | cut -d '.' -f1-2 | sort | uniq)"
   local branches="$( { (git branch -r | grep upstream/release-) ; (git branch | grep release-); } | cut -d '-' -f2 | sort | uniq)"
-  RELEASE_VERSION=""
 
-  [[ -n "${tags}" ]] || abort "cannot obtain release tags for the repository"
-  [[ -n "${branches}" ]] || abort "cannot obtain release branches for the repository"
+  echo "Versions released (from tags): [" ${tags} "]"
+  echo "Versions released (from branches): [" ${branches} "]"
 
-  for i in $branches; do
-    RELEASE_NUMBER=$i
-    for j in $tags; do
-      if [[ "$i" == "$j" ]]; then
-        RELEASE_NUMBER=""
+  local release_number=""
+  for i in ${branches}; do
+    release_number="${i}"
+    for j in ${tags}; do
+      if [[ "${i}" == "${j}" ]]; then
+        release_number=""
       fi
     done
   done
 
-  if [ -z "$RELEASE_NUMBER" ]; then
+  if [[ -z "${release_number}" ]]; then
     echo "*** No new release will be generated, as no new branches exist"
     exit  0
   fi
 
-  RELEASE_VERSION="${RELEASE_NUMBER}.0"
-  RELEASE_BRANCH="release-${RELEASE_NUMBER}"
+  RELEASE_VERSION="${release_number}.0"
+  RELEASE_BRANCH="release-${release_number}"
   echo "Will create release ${RELEASE_VERSION} from branch ${RELEASE_BRANCH}"
   # If --release-notes not used, add a placeholder
   if [[ -z "${RELEASE_NOTES}" ]]; then
@@ -259,7 +261,7 @@ function build_from_nightly_release() {
   for yaml in ${yamls_dir}/*.yaml; do
     sed -i -e "s#${NIGHTLY_GCR}#${RELEASE_GCR}#" "${yaml}"
   done
-  YAMLS_TO_PUBLISH="$(find ${yamls_dir} -name '*.yaml' -printf '%p ')"
+  ARTIFACTS_TO_PUBLISH="$(find ${yamls_dir} -name '*.yaml' -printf '%p ')"
   echo "Copying nightly images"
   copy_nightly_images_to_release_gcr "${NIGHTLY_GCR}" "${FROM_NIGHTLY_RELEASE}"
   # Create a release branch from the nightly release tag.
@@ -461,6 +463,16 @@ function run_validation_tests() {
   fi
 }
 
+# Publishes the generated artifacts to GCS, GitHub, etc.
+# Parameters: $1..$n - files to add to the release.
+function publish_artifacts() {
+  (( ! PUBLISH_RELEASE )) && return
+  tag_images_in_yamls ${ARTIFACTS_TO_PUBLISH}
+  publish_to_gcs ${ARTIFACTS_TO_PUBLISH}
+  publish_to_github ${ARTIFACTS_TO_PUBLISH}
+  banner "New release published successfully"
+}
+
 # Entry point for a release script.
 function main() {
   function_exists build_release || abort "function 'build_release()' not defined"
@@ -501,30 +513,26 @@ function main() {
     git checkout upstream/${RELEASE_BRANCH} || abort "cannot checkout branch ${RELEASE_BRANCH}"
   fi
 
-  set -o errexit
-  set -o pipefail
-
   if [[ -n "${FROM_NIGHTLY_RELEASE}" ]]; then
     build_from_nightly_release
   else
+    set -e -o pipefail
     build_from_source
+    set +e +o pipefail
   fi
-  [[ -z "${YAMLS_TO_PUBLISH}" ]] && abort "no manifests were generated"
-  # Ensure no empty YAML file will be published.
-  for yaml in ${YAMLS_TO_PUBLISH}; do
-    [[ -s ${yaml} ]] || abort "YAML file ${yaml} is empty"
+  # TODO(adrcunha): Remove once all repos use ARTIFACTS_TO_PUBLISH.
+  [[ -z "${ARTIFACTS_TO_PUBLISH}" ]] && ARTIFACTS_TO_PUBLISH="${YAMLS_TO_PUBLISH}"
+  [[ -z "${ARTIFACTS_TO_PUBLISH}" ]] && abort "no artifacts were generated"
+  # Ensure no empty file will be published.
+  for artifact in ${ARTIFACTS_TO_PUBLISH}; do
+    [[ -s ${artifact} ]] || abort "Artifact ${artifact} is empty"
   done
   echo "New release built successfully"
-  if (( PUBLISH_RELEASE )); then
-    tag_images_in_yamls ${YAMLS_TO_PUBLISH}
-    publish_yamls ${YAMLS_TO_PUBLISH}
-    publish_to_github ${YAMLS_TO_PUBLISH}
-    banner "New release published successfully"
-  fi
+  publish_artifacts
 }
 
 # Publishes a new release on GitHub, also git tagging it (unless this is not a versioned release).
-# Parameters: $1..$n - YAML files to add to the release.
+# Parameters: $1..$n - files to add to the release.
 function publish_to_github() {
   (( PUBLISH_TO_GITHUB )) || return 0
   local title="${REPO_NAME_FORMATTED} release ${TAG}"
@@ -532,10 +540,10 @@ function publish_to_github() {
   local description="$(mktemp)"
   local attachments_dir="$(mktemp -d)"
   local commitish=""
-  # Copy each YAML to a separate dir
-  for yaml in $@; do
-    cp ${yaml} ${attachments_dir}/
-    attachments+=("--attach=${yaml}#$(basename ${yaml})")
+  # Copy files to a separate dir
+  for artifact in $@; do
+    cp ${artifact} ${attachments_dir}/
+    attachments+=("--attach=${artifact}#$(basename ${artifact})")
   done
   echo -e "${title}\n" > ${description}
   if [[ -n "${RELEASE_NOTES}" ]]; then
